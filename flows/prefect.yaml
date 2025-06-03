@@ -1,0 +1,28 @@
+name: CKAN Preflow  
+
+deployments:
+  - name: ckan_datastore_ingestion
+    entrypoint: ckan_datastore_ingestion_flow.py:ckan_datastore_ingestion
+    parameters: {}
+    tags: ["ckan", "datastore"]
+    description: |
+      Ingests CKAN resource data into the datastore using Prefect.
+    work_pool:
+      name: default
+      work_queue_name: default    
+      job_variables: {}
+    schedule: []                
+    is_paused: false    
+
+  - name: example_flow
+    entrypoint: example_flow.py:hello_flow
+    parameters: {}
+    tags: ["example"]
+    description: |
+      An example flow to demonstrate Prefect functionality.
+    work_pool:
+      name: default
+      work_queue_name: default    
+      job_variables: {}
+    schedule: []                
+    is_paused: false     

@@ -1,0 +1,4 @@
+pandas==2.2.3
+frictionless==5.18.1
+ckanapi 
+psycopg2-binary
