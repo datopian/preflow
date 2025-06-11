@@ -1,9 +1,8 @@
 import os
-import threading
-
-import pandas as pd
+import json
 import requests
-from frictionless import Resource, Schema
+from frictionless import Resource, Schema, validate, system
+
 from prefect import flow, get_run_logger, task
 from sqlalchemy import create_engine
 
@@ -11,27 +10,9 @@ from ckanapi import RemoteCKAN
 from dependencies.utils import (
     CKANFlowException,
     frictionless_to_ckan_schema,
-    set_ckan_preflow_status,
+    async_set_ckan_preflow_status,
+    df_import_data_to_postgres,
 )
-
-def async_set_ckan_preflow_status(*args, **kwargs):
-    thread = threading.Thread(target=set_ckan_preflow_status, args=args, kwargs=kwargs)
-    thread.daemon = True
-    thread.start()
-
-
-def insert_chunk_to_sql(chunk, engine, table_name, chunk_size):
-    if not chunk:
-        return
-    df = pd.DataFrame(chunk)
-    df.to_sql(
-        name=table_name,
-        con=engine,
-        if_exists="append",
-        index=False,
-        chunksize=chunk_size,
-        method="multi",
-    )
 
 
 @task(retries=3, retry_delay_seconds=10)
@@ -45,8 +26,10 @@ def fetch_ckan_resource_file(ckan_api, resource_dict):
     file_url = resource_dict.get("url")
     try:
         logger.info(f"Fetching resource from {file_url}")
-        resp = requests.get(file_url)
-        logger.info(f"Response status code: {resp.status_code}")
+        headers = {
+            "Authorization": ckan_api.apikey,
+        }
+        resp = requests.get(file_url, headers=headers)
         if resp.status_code == 200:
             local_file_path = f"/tmp/{resource_id}.csv"
             with open(local_file_path, "wb") as f:
@@ -54,9 +37,8 @@ def fetch_ckan_resource_file(ckan_api, resource_dict):
             logger.info(f"File downloaded to {local_file_path}")
             async_set_ckan_preflow_status(
                 ckan_api,
-                resource_id,
+                resource_id=resource_id,
                 message="Downloading file completed successfully.",
-                state="running",
             )
             return local_file_path
         else:
@@ -67,7 +49,11 @@ def fetch_ckan_resource_file(ckan_api, resource_dict):
             )
     except Exception as e:
         logger.error(f"Download failed: {e}")
-        raise CKANFlowException(ckan_api, resource_id, f"Download failed: {e}")
+        raise CKANFlowException(
+            ckan_api,
+            resource_id=resource_id,
+            message=f"Failed to download file: {resp.status_code}",
+        )
 
 
 @task(retries=3, retry_delay_seconds=10)
@@ -101,14 +87,15 @@ def create_ckan_datastore_table(ckan_api, resource_dict):
         )
         async_set_ckan_preflow_status(
             ckan_api,
-            resource_id,
+            resource_id=resource_id,
             message=f"Datastore table created successfully with schema {ckan_schema}",
-            state="running",
         )
     except Exception as e:
         logger.error(f"Failed to create datastore table: {e}")
         raise CKANFlowException(
-            ckan_api, resource_id, f"Failed to create datastore table: {e}"
+            ckan_api,
+            resource_id=resource_id,
+            message=f"Failed to create datastore table in CKAN: {e}",
         )
 
 
@@ -139,16 +126,15 @@ def load_csv_to_postgres_and_cleanup(
                 chunk.append(row)
                 idx += 1
                 if len(chunk) == chunk_size:
-                    insert_chunk_to_sql(chunk, engine, table_name, chunk_size)
+                    df_import_data_to_postgres(chunk, engine, table_name, chunk_size)
                     chunk = []
-            insert_chunk_to_sql(chunk, engine, table_name, chunk_size)
-         
+            df_import_data_to_postgres(chunk, engine, table_name, chunk_size)
 
         logger.info(f"Data ingested to datastore for resource {resource_id}")
 
         async_set_ckan_preflow_status(
             ckan_api,
-            resource_id,
+            resource_id=resource_id,
             message="Data ingestion to datastore completed successfully",
             state="completed",
         )
@@ -160,7 +146,48 @@ def load_csv_to_postgres_and_cleanup(
     except Exception as e:
         logger.error(f"Failed to ingest or cleanup file: {e}")
         raise CKANFlowException(
-            ckan_api, resource_id, f"Failed to ingest data to datastore."
+            ckan_api,
+            resource_id=resource_id,
+            message=f"Failed to ingest data to datastore.",
+        )
+
+
+@task(retries=0, retry_delay_seconds=10)
+def validate_ckan_resource(local_file, ckan_api, resource_dict: dict):
+    """
+    Validate the CKAN resource schema using Frictionless.
+    """
+    logger = get_run_logger()
+    resource_id = resource_dict.get("id")
+    format = resource_dict.get("format", "CSV").lower()
+    schema = Schema(resource_dict.get("schema", {}))
+    logger.info(
+        f"Validating resource {resource_id} with format {format} and schema {schema.to_dict()}"
+    )
+    async_set_ckan_preflow_status(
+        ckan_api,
+        resource_id=resource_id,
+        message="Validating data against schema...",
+        type="info",
+    )
+
+    with system.use_context(trusted=True):
+        resource = Resource(path=local_file, schema=schema, format=format)
+        report = validate(resource).to_dict()
+    if report.get("valid"):
+        async_set_ckan_preflow_status(
+            ckan_api,
+            resource_id=resource_id,
+            message="Data validated successfully",
+            validation_report=report,
+        )
+    else:
+        logger.error(f"Validation failed for resource {resource_id}: {report}")
+        raise CKANFlowException(
+            ckan_api,
+            resource_id=resource_id,
+            message=f"Data is not valid according to the schema.",
+            validation_report=report,
         )
 
 
@@ -179,6 +206,7 @@ def ckan_datastore_ingestion(resource_dict: dict, ckan_config: dict):
     ckan_api = RemoteCKAN(ckan_url, apikey=api_key)
     try:
         local_file = fetch_ckan_resource_file(ckan_api, resource_dict)
+        validate_ckan_resource(local_file, ckan_api, resource_dict)
         create_ckan_datastore_table(ckan_api, resource_dict)
         load_csv_to_postgres_and_cleanup(
             ckan_api, resource_dict, local_file, datastore_db_url, table_name
@@ -187,11 +215,85 @@ def ckan_datastore_ingestion(resource_dict: dict, ckan_config: dict):
 
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        async_set_ckan_preflow_status(
-            ckan_api,
-            resource_dict.get("id"),
-            message=f"{e}",
-            type="error",
-            state="failed",
-        )
         raise
+
+
+if __name__ == "__main__":
+    # Example usage
+    example_resource_dict = {
+        "cache_last_updated": None,
+        "cache_url": None,
+        "created": "2025-06-03T06:42:27.319288",
+        "datastore_active": True,
+        "description": "",
+        "format": "CSV",
+        "hash": "",
+        "id": "d5825e99-47e9-42fb-9ad1-9f7a9ecd53bb",
+        "last_modified": "2025-06-03T06:45:18.442077",
+        "metadata_modified": "2025-06-03T06:45:18.464458",
+        "mimetype": "text/csv",
+        "mimetype_inner": None,
+        "name": "validation",
+        "package_id": "c1fc6f09-e49d-490f-b38c-665e545f8934",
+        "position": 7,
+        "resource_type": None,
+        "size": 210,
+        "state": "active",
+        "url": "http://ckan.com/dataset/c1fc6f09-e49d-490f-b38c-665e545f8934/resource/d5825e99-47e9-42fb-9ad1-9f7a9ecd53bb/download/2025-06-03-06-45-18/validation_test.csv",
+        "url_type": "upload",
+        "schema": {
+            "fields": [
+                {
+                    "name": "id",
+                    "type": "string",
+                    "title": "Identifier",
+                    "description": "A unique numeric identifier for each record.",
+                    "constraints": {
+                        "required": True,
+                        "pattern": "^[0-9]+$",
+                        "minLength": 1,
+                    },
+                    "mask": True,
+                },
+                {
+                    "name": "full_name",
+                    "type": "string",
+                    "title": "Full Name",
+                    "description": "The complete name of the person.",
+                    "constraints": {"required": True, "minLength": 3, "maxLength": 100},
+                },
+                {
+                    "name": "age",
+                    "type": "integer",
+                    "title": "Age",
+                    "description": "The person's age in years.",
+                    "constraints": {"minimum": 0, "maximum": 120},
+                },
+                {
+                    "name": "email",
+                    "type": "string",
+                    "title": "Email Address",
+                    "description": "A valid email address for the person.",
+                    "constraints": {
+                        "required": True,
+                        "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
+                    },
+                    "mask": True,
+                },
+                {
+                    "name": "gender",
+                    "type": "string",
+                    "title": "Gender",
+                    "description": "The person's self-identified gender.",
+                    "constraints": {"enum": ["male", "female", "non-binary", "other"]},
+                },
+            ]
+        },
+    }
+    example_ckan_config = {
+        "ckan_url": "http://ckan.com",
+        "api_key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJDOG1zd1JtSU1yY1BRTnp5TXlscW53cTQzSFA1bnVaWmdua3JubHdyUFFnIiwiaWF0IjoxNzQ4NTA5NDkxfQ.5kWT8noKNOU4v6AWnWw6okKf_LLBVmrbdrVLiFAz4RU",
+        "datastore_db_url": "postgresql://ckandbuser:ckandbpassword@localhost/datastore",
+    }
+
+    ckan_datastore_ingestion(example_resource_dict, example_ckan_config)

@@ -1,3 +1,5 @@
+import threading
+import pandas as pd
 
 
 def frictionless_to_ckan_schema(fields):
@@ -61,26 +63,50 @@ def ckan_to_frictionless_schema(field_type):
     ]
 
 
-def set_ckan_preflow_status(
-    ckan_api, resource_id, message, type="info", state="running"
-):
+def set_ckan_preflow_status(ckan_api, **kwargs) -> None:
     """
     Update the preflow status in CKAN for a given resource.
-    If type is 'error', send as error. Otherwise, send as message.
+    Required kwargs: resource_id, message
+    Optional kwargs: type ('info' or 'error'), state
     """
     try:
-        ckan_api.action.preflow_status_update(
-            resource_id=resource_id,
-            **({"error": message} if type == "error" else {"message": message}),
-            state=state,
-        )
+        ckan_api.action.preflow_status_update(**kwargs)
     except Exception as e:
         raise RuntimeError(f"Failed to update preflow status in CKAN: {e}")
 
 
-class CKANFlowException(Exception):
-    """Custom exception for CKAN Prefect flows that also updates CKAN status."""
+def async_set_ckan_preflow_status(*args, **kwargs):
+    """
+    Asynchronously set the CKAN preflow status using a separate thread.
+    """
+    thread = threading.Thread(target=set_ckan_preflow_status, args=args, kwargs=kwargs)
+    thread.daemon = True
+    thread.start()
 
-    def __init__(self, ckan_api, resource_id, message, state="Failed"):
-        set_ckan_preflow_status(ckan_api, resource_id, message, state)
-        super().__init__(message)
+
+def df_import_data_to_postgres(chunk, engine, table_name, chunk_size=1000):
+    """
+    "Insert a chunk of data into a PostgreSQL table using panda DataFrame's to_sql method.
+    Args:
+        chunk (list): List of dictionaries representing the data to insert.
+        engine (sqlalchemy.engine.Engine): SQLAlchemy engine connected to the PostgreSQL database.
+        table_name (str): Name of the table to insert data into.
+        chunk_size (int): Number of rows to insert in each batch.
+    """
+    if not chunk:
+        return
+    df = pd.DataFrame(chunk)
+    df.to_sql(
+        name=table_name,
+        con=engine,
+        if_exists="append",
+        index=False,
+        chunksize=chunk_size,
+        method="multi",
+    )
+
+
+class CKANFlowException(Exception):
+    def __init__(self, ckan_api, **kwargs):
+        set_ckan_preflow_status(ckan_api, **kwargs)
+        super().__init__(kwargs["message"])
