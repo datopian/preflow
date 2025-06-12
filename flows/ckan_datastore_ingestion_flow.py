@@ -170,24 +170,31 @@ def validate_ckan_resource(local_file, ckan_api, resource_dict: dict):
         message="Validating data against schema...",
         type="info",
     )
-
-    with system.use_context(trusted=True):
-        resource = Resource(path=local_file, schema=schema, format=format)
-        report = validate(resource).to_dict()
-    if report.get("valid"):
-        async_set_ckan_preflow_status(
-            ckan_api,
-            resource_id=resource_id,
-            message="Data validated successfully",
-            validation_report=report,
-        )
-    else:
-        logger.error(f"Validation failed for resource {resource_id}: {report}")
+    try:
+        with system.use_context(trusted=True):
+            resource = Resource(path=local_file, schema=schema, format=format)
+            report = validate(resource).to_dict()
+        if report.get("valid"):
+            async_set_ckan_preflow_status(
+                ckan_api,
+                resource_id=resource_id,
+                message="Data validated successfully",
+                validation_report=report,
+            )
+        else:
+            logger.error(f"Validation failed for resource {resource_id}: {report}")
+            raise CKANFlowException(
+                ckan_api,
+                resource_id=resource_id,
+                message=f"Data is not valid according to the schema.",
+                validation_report=report,
+            )
+    except Exception as e:
+        logger.error(f"Validation error for resource {resource_id}: {e}")
         raise CKANFlowException(
             ckan_api,
             resource_id=resource_id,
-            message=f"Data is not valid according to the schema.",
-            validation_report=report,
+            message=f"Failed to validate data against schema: {e}",
         )
 
 
@@ -203,7 +210,15 @@ def ckan_datastore_ingestion(resource_dict: dict, ckan_config: dict):
     api_key = ckan_config.get("api_key")
     datastore_db_url = ckan_config.get("datastore_db_url")
     table_name = resource_dict.get("id")
+    schema = resource_dict.get("schema", {})
     ckan_api = RemoteCKAN(ckan_url, apikey=api_key)
+
+    if not schema:
+        raise CKANFlowException(
+            ckan_api=ckan_api,
+            resource_id=resource_dict.get("id"),
+            message="Resource schema is required for CKAN datastore ingestion.",
+        )
     try:
         local_file = fetch_ckan_resource_file(ckan_api, resource_dict)
         validate_ckan_resource(local_file, ckan_api, resource_dict)
@@ -216,84 +231,3 @@ def ckan_datastore_ingestion(resource_dict: dict, ckan_config: dict):
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
         raise
-
-
-if __name__ == "__main__":
-    # Example usage
-    example_resource_dict = {
-        "cache_last_updated": None,
-        "cache_url": None,
-        "created": "2025-06-03T06:42:27.319288",
-        "datastore_active": True,
-        "description": "",
-        "format": "CSV",
-        "hash": "",
-        "id": "d5825e99-47e9-42fb-9ad1-9f7a9ecd53bb",
-        "last_modified": "2025-06-03T06:45:18.442077",
-        "metadata_modified": "2025-06-03T06:45:18.464458",
-        "mimetype": "text/csv",
-        "mimetype_inner": None,
-        "name": "validation",
-        "package_id": "c1fc6f09-e49d-490f-b38c-665e545f8934",
-        "position": 7,
-        "resource_type": None,
-        "size": 210,
-        "state": "active",
-        "url": "http://ckan.com/dataset/c1fc6f09-e49d-490f-b38c-665e545f8934/resource/d5825e99-47e9-42fb-9ad1-9f7a9ecd53bb/download/2025-06-03-06-45-18/validation_test.csv",
-        "url_type": "upload",
-        "schema": {
-            "fields": [
-                {
-                    "name": "id",
-                    "type": "string",
-                    "title": "Identifier",
-                    "description": "A unique numeric identifier for each record.",
-                    "constraints": {
-                        "required": True,
-                        "pattern": "^[0-9]+$",
-                        "minLength": 1,
-                    },
-                    "mask": True,
-                },
-                {
-                    "name": "full_name",
-                    "type": "string",
-                    "title": "Full Name",
-                    "description": "The complete name of the person.",
-                    "constraints": {"required": True, "minLength": 3, "maxLength": 100},
-                },
-                {
-                    "name": "age",
-                    "type": "integer",
-                    "title": "Age",
-                    "description": "The person's age in years.",
-                    "constraints": {"minimum": 0, "maximum": 120},
-                },
-                {
-                    "name": "email",
-                    "type": "string",
-                    "title": "Email Address",
-                    "description": "A valid email address for the person.",
-                    "constraints": {
-                        "required": True,
-                        "pattern": "^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$",
-                    },
-                    "mask": True,
-                },
-                {
-                    "name": "gender",
-                    "type": "string",
-                    "title": "Gender",
-                    "description": "The person's self-identified gender.",
-                    "constraints": {"enum": ["male", "female", "non-binary", "other"]},
-                },
-            ]
-        },
-    }
-    example_ckan_config = {
-        "ckan_url": "http://ckan.com",
-        "api_key": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJqdGkiOiJDOG1zd1JtSU1yY1BRTnp5TXlscW53cTQzSFA1bnVaWmdua3JubHdyUFFnIiwiaWF0IjoxNzQ4NTA5NDkxfQ.5kWT8noKNOU4v6AWnWw6okKf_LLBVmrbdrVLiFAz4RU",
-        "datastore_db_url": "postgresql://ckandbuser:ckandbpassword@localhost/datastore",
-    }
-
-    ckan_datastore_ingestion(example_resource_dict, example_ckan_config)
