@@ -108,5 +108,7 @@ def df_import_data_to_postgres(chunk, engine, table_name, chunk_size=1000):
 
 class CKANFlowException(Exception):
     def __init__(self, ckan_api, **kwargs):
+        if "type" not in kwargs:
+            kwargs["type"] = "error"
         set_ckan_preflow_status(ckan_api, **kwargs)
         super().__init__(kwargs["message"])
