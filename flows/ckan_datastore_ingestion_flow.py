@@ -170,33 +170,25 @@ def validate_ckan_resource(local_file, ckan_api, resource_dict: dict):
         message="Validating data against schema...",
         type="info",
     )
-    try:
-        with system.use_context(trusted=True):
-            resource = Resource(path=local_file, schema=schema, format=format)
-            report = validate(resource).to_dict()
-        if report.get("valid"):
-            async_set_ckan_preflow_status(
-                ckan_api,
-                resource_id=resource_id,
-                message="Data validated successfully",
-                validation_report=report,
-            )
-        else:
-            logger.error(f"Validation failed for resource {resource_id}: {report}")
-            raise CKANFlowException(
-                ckan_api,
-                resource_id=resource_id,
-                message=f"Data is not valid according to the schema.",
-                validation_report=report,
-            )
-    except Exception as e:
-        logger.error(f"Validation error for resource {resource_id}: {e}")
+    with system.use_context(trusted=True):
+        resource = Resource(path=local_file, schema=schema, format=format)
+        report = validate(resource).to_dict()
+    if report.get("valid"):
+        async_set_ckan_preflow_status(
+            ckan_api,
+            resource_id=resource_id,
+            message="Data validated successfully",
+            validation_report=report,
+        )
+    else:
+        logger.error(f"Validation failed for resource {resource_id}: {report}")
         raise CKANFlowException(
             ckan_api,
             resource_id=resource_id,
-            message=f"Failed to validate data against schema: {e}",
+            message=f"Data is not valid according to the schema.",
+            validation_report=report,
         )
-
+ 
 
 @flow(name="ckan_datastore_ingestion")
 def ckan_datastore_ingestion(resource_dict: dict, ckan_config: dict):
