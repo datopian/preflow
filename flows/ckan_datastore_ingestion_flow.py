@@ -1,9 +1,9 @@
 import os
-import json
+import mimetypes
 import requests
-from frictionless import Resource, Schema, validate, system
+from frictionless import Resource, Schema, validate, describe, system
 
-from prefect import flow, get_run_logger, task
+from prefect import flow, get_run_logger, task, serve
 from sqlalchemy import create_engine
 
 from ckanapi import RemoteCKAN
@@ -14,6 +14,7 @@ from dependencies.utils import (
     df_import_data_to_postgres,
 )
 
+DEPLOYMENT_ENV = os.getenv("DEPLOYMENT_ENV", "local")
 
 @task(retries=3, retry_delay_seconds=10)
 def fetch_ckan_resource_file(ckan_api, resource_dict):
@@ -31,7 +32,14 @@ def fetch_ckan_resource_file(ckan_api, resource_dict):
         }
         resp = requests.get(file_url, headers=headers)
         if resp.status_code == 200:
-            local_file_path = f"/tmp/{resource_id}.csv"
+            file_extension = os.path.splitext(file_url)[-1]
+            if not file_extension:
+                # Fallback to Content-Type header if no extension in URL
+                content_type = resp.headers.get("Content-Type", "")
+                file_extension = mimetypes.guess_extension(content_type)
+
+            local_file_path = f"/tmp/{resource_id}{file_extension}"
+
             with open(local_file_path, "wb") as f:
                 f.write(resp.content)
             logger.info(f"File downloaded to {local_file_path}")
@@ -188,7 +196,7 @@ def validate_ckan_resource(local_file, ckan_api, resource_dict: dict):
             message=f"Data is not valid according to the schema.",
             validation_report=report,
         )
- 
+
 
 @flow(name="ckan_datastore_ingestion")
 def ckan_datastore_ingestion(resource_dict: dict, ckan_config: dict):
@@ -204,15 +212,12 @@ def ckan_datastore_ingestion(resource_dict: dict, ckan_config: dict):
     table_name = resource_dict.get("id")
     schema = resource_dict.get("schema", {})
     ckan_api = RemoteCKAN(ckan_url, apikey=api_key)
-
-    if not schema:
-        raise CKANFlowException(
-            ckan_api=ckan_api,
-            resource_id=resource_dict.get("id"),
-            message="Resource schema is required for CKAN datastore ingestion.",
-        )
     try:
         local_file = fetch_ckan_resource_file(ckan_api, resource_dict)
+        if not schema:
+            logger.info("No schema provided, describing the resource to infer schema.")
+            resource = describe(path=local_file)
+            resource_dict["schema"] = resource.schema.to_dict()
         validate_ckan_resource(local_file, ckan_api, resource_dict)
         create_ckan_datastore_table(ckan_api, resource_dict)
         load_csv_to_postgres_and_cleanup(
